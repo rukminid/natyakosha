@@ -1,0 +1,61 @@
+rules_version = '2';
+
+// Natyakosha Cloud Storage rules. Files live under schools/{schoolId}/...
+// and are private to members of that school (many students are minors).
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function me() {
+      return firestore.get(/databases/(default)/documents/users/$(request.auth.uid)).data;
+    }
+    // Only approved members of the school (sign-ups start as 'pending').
+    function inSchool(schoolId) {
+      return request.auth != null && me().schoolId == schoolId
+        && me().get('status', 'approved') == 'approved';
+    }
+    function isStaff(schoolId) { return inSchool(schoolId) && me().role in ['guru', 'teacher']; }
+    function isSelfOrChild(studentId) {
+      return request.auth.uid == studentId
+        || (me().role == 'parent' && studentId in me().childIds);
+    }
+    function isImageUnder(mb) {
+      return request.resource.contentType.matches('image/.*')
+        && request.resource.size < mb * 1024 * 1024;
+    }
+
+    // Profile photos: each person manages their own; any signed-in member can see them.
+    match /users/{uid}/profile/{file} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null && request.auth.uid == uid && isImageUnder(5);
+      allow delete: if request.auth != null && request.auth.uid == uid;
+    }
+
+    // Monthly fee screenshots
+    match /schools/{schoolId}/payments/{studentId}/{file} {
+      allow read: if isStaff(schoolId) || (inSchool(schoolId) && isSelfOrChild(studentId));
+      allow create: if inSchool(schoolId) && isSelfOrChild(studentId) && isImageUnder(5);
+      allow delete: if isStaff(schoolId);
+    }
+
+    // Event fee screenshots
+    match /schools/{schoolId}/events/{eventId}/fees/{studentId}/{file} {
+      allow read: if isStaff(schoolId) || (inSchool(schoolId) && isSelfOrChild(studentId));
+      allow create: if inSchool(schoolId) && isSelfOrChild(studentId) && isImageUnder(5);
+      allow delete: if isStaff(schoolId);
+    }
+
+    // Event photos / audio / videos and theory images:
+    // the whole school reads, staff upload. (Explicit paths, not a
+    // wildcard, so these never widen access to the screenshots above.)
+    match /schools/{schoolId}/events/{eventId}/{kind}/{file} {
+      allow read: if inSchool(schoolId) && kind in ['photos', 'audio', 'videos'];
+      allow write: if isStaff(schoolId) && kind in ['photos', 'audio', 'videos']
+        && request.resource.size < 200 * 1024 * 1024;
+    }
+
+    match /schools/{schoolId}/theory/{noteId}/{file} {
+      allow read: if inSchool(schoolId);
+      allow write: if isStaff(schoolId) && isImageUnder(10);
+    }
+  }
+}

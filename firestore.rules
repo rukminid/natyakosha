@@ -1,0 +1,207 @@
+rules_version = '2';
+
+// Natyakosha Firestore rules.
+// Everyone can only touch data of the school in their own users/{uid} doc,
+// and only once a guru of that school has approved them.
+// Gurus/teachers ("staff") manage; students/parents read and upload proof.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() { return request.auth != null; }
+    function me() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    // Accounts created in the console without a status count as approved.
+    function approved() { return me().get('status', 'approved') == 'approved'; }
+    function inSchool(schoolId) { return signedIn() && me().schoolId == schoolId && approved(); }
+    function isStaff(schoolId) { return inSchool(schoolId) && me().role in ['guru', 'teacher']; }
+    // A student, or a parent of that student.
+    function isSelfOrChild(studentId) {
+      return request.auth.uid == studentId
+        || (me().role == 'parent' && studentId in me().get('childIds', []));
+    }
+
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid || isStaff(resource.data.schoolId));
+
+      // Self sign-up:
+      //  - joining an existing institute as guru or student → must be 'pending';
+      //  - registering a brand-new institute → approved guru, only if the same
+      //    batch creates that institute with this user as its owner.
+      allow create: if signedIn() && request.auth.uid == uid
+        // Only a guru can create a guru-added ("managed") student record.
+        && request.resource.data.get('managed', false) == false && (
+          (request.resource.data.status == 'pending'
+            && request.resource.data.role in ['guru', 'student']
+            && exists(/databases/$(database)/documents/schools/$(request.resource.data.schoolId)))
+          || (request.resource.data.status == 'approved'
+            && request.resource.data.role == 'guru'
+            && !exists(/databases/$(database)/documents/schools/$(request.resource.data.schoolId))
+            && getAfter(/databases/$(database)/documents/schools/$(request.resource.data.schoolId)).data.ownerId == uid)
+        )
+        // Staff can still add people directly.
+        || isStaff(request.resource.data.schoolId);
+
+      allow update: if
+        // Staff of the user's school: approve / reject / edit (school can't be changed).
+        (isStaff(resource.data.schoolId) && request.resource.data.schoolId == resource.data.schoolId)
+        // A user may add/remove their own FCM tokens (see below for profile edits).
+        || (request.auth.uid == uid
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['fcmTokens']))
+        // A user may edit their own name, date of birth, gender and photo —
+        // never role, school or approval status.
+        || (request.auth.uid == uid
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['name', 'dob', 'gender', 'photoUrl'])
+            && request.resource.data.name is string
+            && request.resource.data.name.size() >= 2
+            && request.resource.data.name.size() <= 60);
+      allow delete: if false;
+    }
+
+    // Server-only (Cloud Functions use the Admin SDK and bypass rules).
+    match /rateLimits/{doc} {
+      allow read, write: if false;
+    }
+
+    match /schools/{schoolId} {
+      // Name + city are public so the sign-up screen can list institutes.
+      allow read: if true;
+      // A guru registering a new institute becomes its owner.
+      allow create: if signedIn()
+        && request.resource.data.ownerId == request.auth.uid
+        && request.resource.data.keys().hasOnly(['name', 'city', 'ownerId', 'active', 'createdAt']);
+      allow update: if isStaff(schoolId)
+        && request.resource.data.ownerId == resource.data.ownerId;
+      allow delete: if false;
+
+      match /payments/{paymentId} {
+        allow read: if isStaff(schoolId)
+          || (inSchool(schoolId) && isSelfOrChild(resource.data.studentId));
+        // Students/parents submit their own proof, always as "submitted".
+        allow create: if inSchool(schoolId)
+          && isSelfOrChild(request.resource.data.studentId)
+          && request.resource.data.status == 'submitted';
+        // Only staff verify/reject.
+        allow update, delete: if isStaff(schoolId);
+      }
+
+      match /events/{eventId} {
+        allow read: if inSchool(schoolId);
+        allow write: if isStaff(schoolId);
+
+        match /items/{itemId} {
+          allow read: if inSchool(schoolId);
+          allow write: if isStaff(schoolId);
+        }
+
+        match /fees/{studentId} {
+          allow read: if isStaff(schoolId) || (inSchool(schoolId) && isSelfOrChild(studentId));
+          allow write: if isStaff(schoolId);
+          // Participant may attach proof and move to "submitted" only.
+          allow update: if inSchool(schoolId) && isSelfOrChild(studentId)
+            && request.resource.data.diff(resource.data).affectedKeys()
+                 .hasOnly(['screenshotUrl', 'upiTxnId', 'status', 'note'])
+            && request.resource.data.status == 'submitted';
+        }
+      }
+
+      // Directory: name, role, photo and birthday (day + month only) of every
+      // approved member, so chat pickers and the birthday board work for
+      // students, who cannot read other users' profiles. Everyone writes only
+      // their own entry, and cannot claim a different role.
+      match /directory/{uid} {
+        allow read: if inSchool(schoolId);
+        allow create, update: if inSchool(schoolId) && request.auth.uid == uid
+          && request.resource.data.role == me().role
+          && request.resource.data.name is string
+          && request.resource.data.name.size() >= 2
+          && request.resource.data.name.size() <= 60
+          && request.resource.data.keys()
+               .hasOnly(['name', 'role', 'photoUrl', 'birthMonth', 'birthDay', 'updatedAt']);
+
+        // Staff keep the entries of students they added (who have no login).
+        allow create, update: if isStaff(schoolId)
+          && request.resource.data.managed == true
+          && request.resource.data.role == 'student'
+          && request.resource.data.name is string
+          && request.resource.data.name.size() >= 2
+          && request.resource.data.name.size() <= 60
+          && request.resource.data.keys()
+               .hasOnly(['name', 'role', 'photoUrl', 'birthMonth', 'birthDay', 'managed', 'updatedAt']);
+        allow delete: if isStaff(schoolId) && resource.data.get('managed', false) == true;
+      }
+
+      // Chat. Only the people in a conversation can read it. Many dancers are
+      // minors, so a one-to-one chat must include a guru or teacher, and only
+      // staff create groups.
+      match /chats/{chatId} {
+        function otherMember() {
+          return request.resource.data.memberIds[0] == request.auth.uid
+            ? request.resource.data.memberIds[1]
+            : request.resource.data.memberIds[0];
+        }
+        function otherIsStaff() {
+          return get(/databases/$(database)/documents/schools/$(schoolId)/directory/$(otherMember()))
+            .data.role in ['guru', 'teacher'];
+        }
+        function inChat() {
+          return request.auth.uid in get(/databases/$(database)/documents/schools/$(schoolId)/chats/$(chatId)).data.memberIds;
+        }
+
+        allow read: if inSchool(schoolId) && request.auth.uid in resource.data.memberIds;
+        allow create: if inSchool(schoolId)
+          && request.resource.data.createdBy == request.auth.uid
+          && request.auth.uid in request.resource.data.memberIds
+          && (
+            (request.resource.data.type == 'direct'
+              && request.resource.data.memberIds.size() == 2
+              && request.resource.data.memberIds[0] != request.resource.data.memberIds[1]
+              && (isStaff(schoolId) || otherIsStaff()))
+            || (request.resource.data.type == 'group'
+              && isStaff(schoolId)
+              && request.resource.data.memberIds.size() >= 2
+              && request.resource.data.name is string
+              && request.resource.data.name.size() >= 1
+              && request.resource.data.name.size() <= 60)
+          );
+        // Members only refresh the "last message" preview.
+        allow update: if inSchool(schoolId) && request.auth.uid in resource.data.memberIds
+          && request.resource.data.diff(resource.data).affectedKeys()
+               .hasOnly(['lastMessage', 'lastMessageAt', 'lastSenderId']);
+        allow delete: if false;
+
+        match /messages/{messageId} {
+          allow read: if inSchool(schoolId) && inChat();
+          allow create: if inSchool(schoolId) && inChat()
+            && request.resource.data.senderId == request.auth.uid
+            && request.resource.data.text is string
+            && request.resource.data.text.size() >= 1
+            && request.resource.data.text.size() <= 2000
+            && request.resource.data.createdAt == request.time;
+          // Staff in the chat can remove a message.
+          allow delete: if isStaff(schoolId) && inChat();
+        }
+      }
+
+      // Attendance: one record lists every student's mark, so only staff
+      // can read it (students' own view would need per-student records).
+      match /attendance/{recordId} {
+        allow read, write: if isStaff(schoolId);
+      }
+
+      // Each student's own marks (a copy written with the class record), so a
+      // student or parent reads only their own days.
+      match /studentAttendance/{studentId}/days/{dayId} {
+        allow read: if isStaff(schoolId) || (inSchool(schoolId) && isSelfOrChild(studentId));
+        allow write: if isStaff(schoolId);
+      }
+
+      // Batches, groups, announcements, media, theory:
+      // whole school reads, staff writes. Rules are OR-ed across matches,
+      // so exclude the collections that have stricter rules above.
+      match /{collection}/{docId} {
+        allow read: if inSchool(schoolId) && !(collection in ['payments', 'events', 'chats', 'attendance']);
+        allow write: if isStaff(schoolId) && !(collection in ['chats', 'directory']);
+      }
+    }
+  }
+}
